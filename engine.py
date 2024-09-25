@@ -42,7 +42,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 if wd_schedule_values is not None and param_group["weight_decay"] > 0:
                     param_group["weight_decay"] = wd_schedule_values[it]
 
-        if hasattr(model.module, 'net_update_temperature'):
+        if hasattr(model.modules, 'net_update_temperature'):
             temp = get_temperature(data_iter_step + 1, epoch, len(data_loader),
                                    temp_epoch=args.temp_epoch, temp_init_value=args.temp_init_value)
             model.module.net_update_temperature(temp)

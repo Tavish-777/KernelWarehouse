@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -101,8 +102,14 @@ class Attention(nn.Module):
         x = (1.0 - self.temp_value) * x.reshape(-1, self.kw_planes) \
             + self.temp_value * self.temp_bias.to(x.device).view(1, -1)
         return x.reshape(-1, self.kw_planes_per_mixture)[:, :-1]
-
-
+    def Fourier(self,M,d):
+        E = torch.randperm(M*d)
+        E = torch.stack([E // d,E %d],dim = 0)[:M]
+        c = nn.Parameter(torch.randn(M),requires_grad = True)
+        F = torch.zeros(M,d)
+        F[E[0,:],E[1,:]] = c
+        Delta_W = torch.fft.ifft2(F).real
+        return  Delta_W
 class KWconvNd(nn.Module):
     dimension = None
     permute = None
@@ -125,7 +132,7 @@ class KWconvNd(nn.Module):
     def init_attention(self, cell, start_cell_idx, reduction, cell_num_ratio, norm_layer, nonlocal_basis_ratio=1.0):
         self.cell_shape = cell.shape # [M, C_{out}, C_{in}, D, H, W]
         self.groups_out_channel = self.out_planes // self.cell_shape[1]
-        self.groups_in_channel = self.in_planes // self.cell_shape[2] // self.groups
+        self.groups_in_channel = self.in_planes // self.cell_shape[1] // self.groups
         self.groups_spatial = 1
         for idx in range(len(self.kernel_size)):
             self.groups_spatial = self.groups_spatial * self.kernel_size[idx] // self.cell_shape[3 + idx]
@@ -134,12 +141,13 @@ class KWconvNd(nn.Module):
                                    norm_layer=norm_layer, nonlocal_basis_ratio=nonlocal_basis_ratio,
                                    cell_num_ratio=cell_num_ratio, start_cell_idx=start_cell_idx)
         return self.attention.init_temperature(start_cell_idx, cell_num_ratio)
-
     def forward(self, x):
         kw_attention = self.attention(x)
+
         batch_size = x.shape[0]
         x = x.reshape(1, -1, *x.shape[2:])
         weight = self.warehouse_manager[0].take_cell(self.warehouse_id).reshape(self.cell_shape[0], -1)
+        # weight = self.Fourier(self.cell_shape[0],self.cell_shape[1] * self.cell_shape[2]).cuda()
         aggregate_weight = torch.mm(kw_attention, weight)
         aggregate_weight = aggregate_weight.reshape([batch_size, self.groups_spatial, self.groups_out_channel,
                                                      self.groups_in_channel, *self.cell_shape[1:]])
@@ -183,7 +191,6 @@ class KWLinear(nn.Module):
         x = self.conv(x.reshape(shape[0], -1, shape[-1]).transpose(1, 2))
         x = x.transpose(1, 2).reshape(*shape[:-1], -1)
         return x
-
 
 class Warehouse_Manager(nn.Module):
     def __init__(self, reduction=0.0625, cell_num_ratio=1, cell_inplane_ratio=1,
@@ -271,6 +278,7 @@ class Warehouse_Manager(nn.Module):
         self.cell_outplane_ratio = parse(self.cell_outplane_ratio, len(warehouse_names))
         self.cell_inplane_ratio = parse(self.cell_inplane_ratio, len(warehouse_names))
         self.weights = nn.ParameterList()
+        self.select =torch.rand(())
 
         for idx, warehouse_name in enumerate(self.warehouse_list.keys()):
             warehouse = self.warehouse_list[warehouse_name]
@@ -296,13 +304,19 @@ class Warehouse_Manager(nn.Module):
 
                 for d in range(dimension):
                     groups_spatial = int(groups_spatial * layer[2 + d] // cell_kernel_size[d])
-
                 num_layer_mixtures = groups_spatial * groups_channel
                 num_total_mixtures += num_layer_mixtures
-
-            self.weights.append(nn.Parameter(torch.randn(
-                max(int(num_total_mixtures * self.cell_num_ratio[idx]), 1),
-                cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True))
+            num_fourier = math.ceil(num_total_mixtures * 0.2)
+            num_norm = num_total_mixtures - num_fourier
+            E = nn.Parameter(torch.randn(num_fourier * self.cell_num_ratio[idx],cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True)
+            E = torch.fft.ifft2(E).real
+            norm_conv_weight = nn.Parameter(torch.randn(max(int(num_norm * self.cell_num_ratio[idx]), 1),
+            cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True)
+            E = torch.cat((E,norm_conv_weight),dim=0)
+            # self.weights.append(nn.Parameter(torch.randn(
+            #     max(int(num_total_mixtures * self.cell_num_ratio[idx]), 1),
+            #     cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True))
+            self.weights.append(E)
 
     def allocate(self, network, _init_weights=partial(nn.init.kaiming_normal_, mode='fan_out', nonlinearity='relu')):
         num_warehouse = len(self.weights)

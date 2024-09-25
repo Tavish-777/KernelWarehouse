@@ -6,7 +6,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import json
 import os
-
+from torchvision import models
 from pathlib import Path
 
 from timm.data.mixup import Mixup
@@ -312,7 +312,6 @@ def main(args):
         nonlocal_basis_ratio=args.nonlocal_basis_ratio,
         dropout=args.dropout,
         )
-
     if args.finetune:
         if args.finetune.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -393,7 +392,7 @@ def main(args):
         args.weight_decay_end = args.weight_decay
     wd_schedule_values = utils.cosine_scheduler(
         args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
-    print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
+    # print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
 
     if mixup_fn is not None:
         # smoothing is handled with mixup label transform
