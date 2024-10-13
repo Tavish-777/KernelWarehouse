@@ -23,8 +23,12 @@ def build_dataset(is_train, args):
     print("---------------------------")
 
     if args.data_set == 'CIFAR':
-        dataset = datasets.CIFAR100(args.data_path, train=is_train, transform=transform, download=True)
-        nb_classes = 100
+        if args.data_path == "cifar100":
+            dataset = datasets.CIFAR100(args.data_path, train=is_train, transform=transform, download=True)
+            nb_classes = 100
+        if args.data_path =="cifar10":
+            dataset = datasets.CIFAR10(args.data_path, train=is_train, transform=transform, download=True)
+            nb_classes = 100
     elif args.data_set == 'IMNET':
         print("reading from datapath", args.data_path)
         root = os.path.join(args.data_path, 'train' if is_train else 'val')
