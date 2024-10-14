@@ -143,12 +143,12 @@ class KWconvNd(nn.Module):
         return self.attention.init_temperature(start_cell_idx, cell_num_ratio)
     def forward(self, x):
         kw_attention = self.attention(x)
-
         batch_size = x.shape[0]
         x = x.reshape(1, -1, *x.shape[2:])
         weight = self.warehouse_manager[0].take_cell(self.warehouse_id).reshape(self.cell_shape[0], -1)
         # weight = self.Fourier(self.cell_shape[0],self.cell_shape[1] * self.cell_shape[2]).cuda()
         aggregate_weight = torch.mm(kw_attention, weight)
+
         aggregate_weight = aggregate_weight.reshape([batch_size, self.groups_spatial, self.groups_out_channel,
                                                      self.groups_in_channel, *self.cell_shape[1:]])
         aggregate_weight = aggregate_weight.permute(*self.permute)
@@ -306,20 +306,24 @@ class Warehouse_Manager(nn.Module):
                     groups_spatial = int(groups_spatial * layer[2 + d] // cell_kernel_size[d])
                 num_layer_mixtures = groups_spatial * groups_channel
                 num_total_mixtures += num_layer_mixtures
-            num_fourier = math.ceil(num_total_mixtures * 0.5)
+            num_fourier = math.ceil(num_total_mixtures * 0.2)
             num_norm = num_total_mixtures - num_fourier
             E = nn.Parameter(torch.randn(num_fourier * self.cell_num_ratio[idx],cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True)
             norm_conv_weight = nn.Parameter(torch.randn(max(int(num_norm * self.cell_num_ratio[idx]), 1),
             cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True)
             E = torch.cat((norm_conv_weight,E),dim=0)
             E_frequency = torch.fft.ifft2(E).real
+            frequency_normavg = torch.mean(E_frequency[:num_norm],dim=0).unsqueeze(0)
             with torch.no_grad():
-                avg_frequency = (E_frequency[:num_fourier] + E_frequency[num_norm:]) /2
+                avg_frequency = (frequency_normavg + E_frequency[num_fourier:]) / 2
             # E = torch.cat((E[:num_norm],E_frequency[torch.randint(num_fourier,num_total_mixtures,(int(num_fourier/2),))],
             #                avg_frequency[torch.randint(num_fourier,(int(num_fourier/2),))]),dim=0)
+
+            E = torch.cat(
+                (E[:num_norm], E_frequency[num_fourier:],avg_frequency),dim=0)
             # self.weights.append(nn.Parameter(torch.randn(
             #     max(int(num_total_mixtures * self.cell_num_ratio[idx]), 1),
-            #     cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True))
+            #     cell_out_plane, cell_in_plane, *cell_kernel_siz), requires_grad=True))
             self.weights.append(E)
     def allocate(self, network, _init_weights=partial(nn.init.kaiming_normal_, mode='fan_out', nonlinearity='relu')):
         num_warehouse = len(self.weights)
