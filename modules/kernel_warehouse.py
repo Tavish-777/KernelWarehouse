@@ -8,6 +8,9 @@ import collections.abc
 import math
 from functools import partial
 
+from triton.language import dtype
+
+a = 0.2
 
 def parse(x, n):
     if isinstance(x, collections.abc.Iterable):
@@ -102,14 +105,6 @@ class Attention(nn.Module):
         x = (1.0 - self.temp_value) * x.reshape(-1, self.kw_planes) \
             + self.temp_value * self.temp_bias.to(x.device).view(1, -1)
         return x.reshape(-1, self.kw_planes_per_mixture)[:, :-1]
-    def Fourier(self,M,d):
-        E = torch.randperm(M*d)
-        E = torch.stack([E // d,E %d],dim = 0)[:M]
-        c = nn.Parameter(torch.randn(M),requires_grad = True)
-        F = torch.zeros(M,d)
-        F[E[0,:],E[1,:]] = c
-        Delta_W = torch.fft.ifft2(F).real
-        return  Delta_W
 class KWconvNd(nn.Module):
     dimension = None
     permute = None
@@ -129,23 +124,31 @@ class KWconvNd(nn.Module):
         self.warehouse_id = warehouse_id
         self.warehouse_manager = [warehouse_manager]  # avoid repeat registration for warehouse manager
 
-    def init_attention(self, cell, start_cell_idx, reduction, cell_num_ratio, norm_layer, nonlocal_basis_ratio=1.0):
+    def init_attention(self, cell, start_cell_idx, reduction, cell_num_ratio, norm_layer, nonlocal_basis_ratio=1.0,num_F=0):
         self.cell_shape = cell.shape # [M, C_{out}, C_{in}, D, H, W]
         self.groups_out_channel = self.out_planes // self.cell_shape[1]
         self.groups_in_channel = self.in_planes // self.cell_shape[1] // self.groups
         self.groups_spatial = 1
+
+        self.norm_cell_num = self.cell_shape[0] - num_F
         for idx in range(len(self.kernel_size)):
             self.groups_spatial = self.groups_spatial * self.kernel_size[idx] // self.cell_shape[3 + idx]
         num_local_mixture = self.groups_out_channel * self.groups_in_channel * self.groups_spatial
-        self.attention = Attention(self.in_planes, reduction, self.cell_shape[0], num_local_mixture,
+        self.attention = Attention(self.in_planes, reduction, self.norm_cell_num, num_local_mixture,
+                                   norm_layer=norm_layer, nonlocal_basis_ratio=nonlocal_basis_ratio,
+                                   cell_num_ratio=cell_num_ratio, start_cell_idx=start_cell_idx)
+        self.Fattention = Attention(self.in_planes, reduction, num_F, num_local_mixture,
                                    norm_layer=norm_layer, nonlocal_basis_ratio=nonlocal_basis_ratio,
                                    cell_num_ratio=cell_num_ratio, start_cell_idx=start_cell_idx)
         return self.attention.init_temperature(start_cell_idx, cell_num_ratio)
     def forward(self, x):
+        self.num_F = self.cell_shape[0] - x.shape[2]
         kw_attention = self.attention(x)
         batch_size = x.shape[0]
         x = x.reshape(1, -1, *x.shape[2:])
         weight = self.warehouse_manager[0].take_cell(self.warehouse_id).reshape(self.cell_shape[0], -1)
+        weight = weight[:(self.cell_shape[0] - self.num_F),:]
+        F_weight = weight[-self.num_F:,:]
         # weight = self.Fourier(self.cell_shape[0],self.cell_shape[1] * self.cell_shape[2]).cuda()
         aggregate_weight = torch.mm(kw_attention, weight)
 
@@ -156,8 +159,23 @@ class KWconvNd(nn.Module):
         output = self.func_conv(x, weight=aggregate_weight, bias=None, stride=self.stride, padding=self.padding,
                                 dilation=self.dilation, groups=self.groups * batch_size)
         output = output.view(batch_size, self.out_planes, *output.shape[2:])
+        Fkw_attention = self.Fattention(x)
+        F_weight = torch.fft.fft2(F_weight)
+        F_aggregate_weight = torch.mm(Fkw_attention, F_weight)
+
+        F_aggregate_weight = F_aggregate_weight.reshape([batch_size, self.groups_spatial, self.groups_out_channel,
+                                                     self.groups_in_channel, *self.cell_shape[1:]])
+        F_aggregate_weight = F_aggregate_weight.permute(*self.permute)
+        F_aggregate_weight = F_aggregate_weight.reshape(-1, self.in_planes // self.groups, *self.kernel_size)
+        F_x = torch.fft.fft2(x)
+        F_output = self.func_conv(F_x, weight=F_aggregate_weight, bias=None, stride=self.stride, padding=self.padding,
+                                dilation=self.dilation, groups=self.groups * batch_size)
+        F_output = torch.fft.ifft2(F_output).real()
+        F_output = F_output.view(batch_size, self.out_planes, *output.shape[2:])
         if self.bias is not None:
             output = output + self.bias.reshape(1, -1, *([1]*self.dimension))
+            F_output = F_output + self.bias.reshape(1, -1, *([1] * self.dimension))
+        output = output + F_output
         return output
 
 
@@ -226,6 +244,7 @@ class Warehouse_Manager(nn.Module):
         self.norm_layer = norm_layer
         self.nonlocal_basis_ratio = nonlocal_basis_ratio
 
+
     def fuse_warehouse_name(self, warehouse_name):
         fused_names = []
         for sub_name in warehouse_name.split('_'):
@@ -279,6 +298,7 @@ class Warehouse_Manager(nn.Module):
         self.cell_inplane_ratio = parse(self.cell_inplane_ratio, len(warehouse_names))
         self.weights = nn.ParameterList()
         self.select =torch.rand(())
+        self.num_F = []
 
         for idx, warehouse_name in enumerate(self.warehouse_list.keys()):
             warehouse = self.warehouse_list[warehouse_name]
@@ -306,25 +326,25 @@ class Warehouse_Manager(nn.Module):
                     groups_spatial = int(groups_spatial * layer[2 + d] // cell_kernel_size[d])
                 num_layer_mixtures = groups_spatial * groups_channel
                 num_total_mixtures += num_layer_mixtures
-            num_fourier = math.ceil(num_total_mixtures * 0.2)
+            num_fourier = math.ceil(num_total_mixtures * a)
             num_norm = num_total_mixtures - num_fourier
             E = nn.Parameter(torch.randn(num_fourier * self.cell_num_ratio[idx],cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True)
-            norm_conv_weight = nn.Parameter(torch.randn(max(int(num_norm * self.cell_num_ratio[idx]), 1),
+            norm_conv_weight = nn.Parameter(torch.randn(max(int(num_total_mixtures * self.cell_num_ratio[idx]), 1),
             cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True)
-            E = torch.cat((norm_conv_weight,E),dim=0)
-            E_frequency = torch.fft.ifft2(E).real
-            frequency_normavg = torch.mean(E_frequency[:num_norm],dim=0).unsqueeze(0)
-            with torch.no_grad():
-                avg_frequency = (frequency_normavg + E_frequency[num_fourier:]) / 2
+            # E = torch.cat((norm_conv_weight,E),dim=0)
+            # frequency_normavg = torch.mean(E_frequency[:num_norm],dim=0).unsqueeze(0)
+            # with torch.no_grad():
+            #     avg_frequency = (frequency_normavg + E_frequency[num_fourier:] /2)
             # E = torch.cat((E[:num_norm],E_frequency[torch.randint(num_fourier,num_total_mixtures,(int(num_fourier/2),))],
             #                avg_frequency[torch.randint(num_fourier,(int(num_fourier/2),))]),dim=0)
 
-            E = torch.cat(
-                (E[:num_norm], E_frequency[num_fourier:],avg_frequency),dim=0)
+            all_weight = torch.cat(
+                (norm_conv_weight, E),dim=0)
             # self.weights.append(nn.Parameter(torch.randn(
             #     max(int(num_total_mixtures * self.cell_num_ratio[idx]), 1),
             #     cell_out_plane, cell_in_plane, *cell_kernel_siz), requires_grad=True))
-            self.weights.append(E)
+            self.weights.append(all_weight)
+            self.num_F.append(num_fourier)
     def allocate(self, network, _init_weights=partial(nn.init.kaiming_normal_, mode='fan_out', nonlinearity='relu')):
         num_warehouse = len(self.weights)
         end_idxs = [0] * num_warehouse
@@ -338,7 +358,8 @@ class Warehouse_Manager(nn.Module):
                                                     self.reduction[warehouse_idx],
                                                     self.cell_num_ratio[warehouse_idx],
                                                     norm_layer=self.norm_layer,
-                                                    nonlocal_basis_ratio=self.nonlocal_basis_ratio)
+                                                    nonlocal_basis_ratio=self.nonlocal_basis_ratio,
+                                                    num_F= self.num_F[warehouse_idx])
                 _init_weights(self.weights[warehouse_idx][start_cell_idx:end_cell_idx].view(
                     -1, *self.weights[warehouse_idx].shape[2:]))
                 end_idxs[warehouse_idx] = end_cell_idx
@@ -350,4 +371,5 @@ class Warehouse_Manager(nn.Module):
 
     def take_cell(self, warehouse_idx):
         return self.weights[warehouse_idx]
+
 
