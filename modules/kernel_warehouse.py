@@ -7,7 +7,7 @@ from itertools import repeat
 import collections.abc
 import math
 from functools import partial
-
+from torch.cuda.amp import autocast
 from triton.language import dtype
 
 a = 0.2
@@ -26,7 +26,7 @@ def parse(x, n):
 
 class Attention(nn.Module):
     def __init__(self, in_planes, reduction, num_static_cell, num_local_mixture, norm_layer=nn.BatchNorm1d,
-                 cell_num_ratio=1.0, nonlocal_basis_ratio=1.0, start_cell_idx=None):
+                 cell_num_ratio=1.0, nonlocal_basis_ratio=1.0, start_cell_idx=None,out_planes=0,num_F = 0):
         super(Attention, self).__init__()
         hidden_planes = max(int(in_planes * reduction), 16)
         self.kw_planes_per_mixture = num_static_cell + 1
@@ -41,6 +41,7 @@ class Attention(nn.Module):
         self.fc1 = nn.Linear(in_planes, hidden_planes, bias=(norm_layer is not nn.BatchNorm1d))
         self.norm1 = norm_layer(hidden_planes)
         self.act1 = nn.ReLU(inplace=True)
+        self.fc4 = nn.Linear(hidden_planes, out_planes*num_F, bias=(norm_layer is not nn.BatchNorm1d))
 
         if nonlocal_basis_ratio >= 1.0:
             self.map_to_cell = nn.Identity()
@@ -105,6 +106,11 @@ class Attention(nn.Module):
         x = (1.0 - self.temp_value) * x.reshape(-1, self.kw_planes) \
             + self.temp_value * self.temp_bias.to(x.device).view(1, -1)
         return x.reshape(-1, self.kw_planes_per_mixture)[:, :-1]
+    def fft_forward(self,x):
+        x = self.avgpool(x.reshape(*x.shape[:2], -1)).squeeze(dim=-1)
+        x = self.act1(self.norm1(self.fc1(x)))
+        x = self.map_to_cell(self.fc4(x))
+        return x
 class KWconvNd(nn.Module):
     dimension = None
     permute = None
@@ -134,51 +140,46 @@ class KWconvNd(nn.Module):
         for idx in range(len(self.kernel_size)):
             self.groups_spatial = self.groups_spatial * self.kernel_size[idx] // self.cell_shape[3 + idx]
         num_local_mixture = self.groups_out_channel * self.groups_in_channel * self.groups_spatial
+        self.num_F = self.warehouse_manager[0].take_numF(self.warehouse_id)
         self.attention = Attention(self.in_planes, reduction, self.norm_cell_num, num_local_mixture,
                                    norm_layer=norm_layer, nonlocal_basis_ratio=nonlocal_basis_ratio,
-                                   cell_num_ratio=cell_num_ratio, start_cell_idx=start_cell_idx)
+                                   cell_num_ratio=cell_num_ratio, start_cell_idx=start_cell_idx,out_planes=self.out_planes,num_F = self.num_F)
+
         return self.attention.init_temperature(start_cell_idx, cell_num_ratio)
     def forward(self, x):
-        self.num_F = self.warehouse_manager[0].take_numF(self.warehouse_id)
         kw_attention = self.attention(x)
-        Fkw_attention = kw_attention[:,-self.num_F:]
-        kw_attention = kw_attention[:,:-self.num_F]
+        Fkw_attention = self.attention.fft_forward(x)
         batch_size = x.shape[0]
         x = x.reshape(1, -1, *x.shape[2:])
         weight = self.warehouse_manager[0].take_cell(self.warehouse_id).reshape(self.cell_shape[0], -1)
-        # weight = weight[:(self.cell_shape[0] - self.num_F),:]
-        # F_weight = weight[-self.num_F:,:]
+        weight = weight[:(self.cell_shape[0] - self.num_F),:]
+        F_weight = weight[-self.num_F:,:]
         # weight = self.Fourier(self.cell_shape[0],self.cell_shape[1] * self.cell_shape[2]).cuda()
         aggregate_weight = torch.mm(kw_attention, weight)
-
         aggregate_weight = aggregate_weight.reshape([batch_size, self.groups_spatial, self.groups_out_channel,
                                                      self.groups_in_channel, *self.cell_shape[1:]])
         aggregate_weight = aggregate_weight.permute(*self.permute)
         aggregate_weight = aggregate_weight.reshape(-1, self.in_planes // self.groups, *self.kernel_size)
+
         output = self.func_conv(x, weight=aggregate_weight, bias=None, stride=self.stride, padding=self.padding,
                                 dilation=self.dilation, groups=self.groups * batch_size)
         output = output.view(batch_size, self.out_planes, *output.shape[2:])
-        x_fft = torch.fft.fft2(x)  # 对输入x进行傅里叶变换
-        weight_fft = torch.fft.fft2(Fkw_attention, s=x.shape[2:])
-        output_fft = x_fft * weight_fft
-        output_fft = torch.fft.ifft2(output_fft).real  # 进行逆傅里叶变换，得到空间域的输出
-        # F_weight = torch.fft.fft2(F_weight)
-        # Fkw_attention = torch.fft.fft2(Fkw_attention)
-        # F_aggregate_weight = torch.mm(Fkw_attention, F_weight)
-        #
-        # F_aggregate_weight = F_aggregate_weight.reshape([batch_size, self.groups_spatial, self.groups_out_channel,
-        #                                              self.groups_in_channel, *self.cell_shape[1:]])
-        # F_aggregate_weight = F_aggregate_weight.permute(*self.permute)
-        # F_aggregate_weight = F_aggregate_weight.reshape(-1, self.in_planes // self.groups, *self.kernel_size)
-        # F_x = torch.fft.fft2(x.to(torch.float32))
-        # F_output = self.func_conv(F_x, weight=F_aggregate_weight, bias=None, stride=self.stride, padding=self.padding,
+        # x = torch.nn.functional.pad(x, (0, 8, 0, 8))
+        # x_fft = torch.fft.fft2(x.to(torch.float16))
+        Fkw_attention = Fkw_attention.reshape(batch_size*self.out_planes,self.num_F)
+        F_weight = torch.fft.fft2(F_weight).real
+        F_aggregate_weight = torch.mm(Fkw_attention, F_weight)
+        F_x = torch.fft.fft2(x.to(torch.float32))
+        F_output = F_x * F_aggregate_weight.view(-1,*F_x.shape[-2:])
+        F_output = torch.fft.ifft2(F_output)
+        # F_aggregate_weight = torch.fft.ifft2(F_aggregate_weight).real
+        # F_output = self.func_conv(x, weight=F_aggregate_weight, bias=None, stride=self.stride, padding=self.padding,
         #                         dilation=self.dilation, groups=self.groups * batch_size)
-        # F_output = torch.fft.ifft2(F_output).real
-        # F_output = F_output.view(batch_size, self.out_planes, *output.shape[2:])
+        F_output = F_output.view(batch_size, self.out_planes, *output.shape[2:])
         if self.bias is not None:
             output = output + self.bias.reshape(1, -1, *([1]*self.dimension))
-            # F_output = F_output + self.bias.reshape(1, -1, *([1] * self.dimension))
-        output = output +output_fft
+            F_output = F_output + self.bias.reshape(1, -1, *([1] * self.dimension))
+        output = output + F_output
         return output
 
 
