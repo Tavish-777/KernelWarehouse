@@ -5,32 +5,38 @@ from timm.models.layers import DropPath
 from timm.models.registry import register_model
 
 
-def kwconv3x3(in_planes, out_planes, stride=1, warehouse_name=None, warehouse_manager=None, enabled=True):
+def kwconv3x3(in_planes, out_planes, stride=1, warehouse_name=None, warehouse_manager=None, enabled=True, feature_map_size=None):
     return warehouse_manager.reserve(in_planes, out_planes, kernel_size=3, stride=stride, padding=1,
-                                     warehouse_name=warehouse_name, enabled=enabled, bias=False)
+                                     warehouse_name=warehouse_name, enabled=enabled, bias=False,
+                                     feature_map_size=feature_map_size, layer_type='conv2d')
 
-
-def kwconv1x1(in_planes, out_planes, stride=1, warehouse_name=None, warehouse_manager=None, enabled=True):
+def kwconv1x1(in_planes, out_planes, stride=1, warehouse_name=None, warehouse_manager=None, enabled=True, feature_map_size=None):
     return warehouse_manager.reserve(in_planes, out_planes, kernel_size=1, stride=stride, padding=0,
-                                     warehouse_name=warehouse_name, enabled=enabled, bias=False)
-
+                                     warehouse_name=warehouse_name, enabled=enabled, bias=False,
+                                     feature_map_size=feature_map_size, layer_type='conv2d')
 
 class BasicBlock(nn.Module):
     expansion = 1
-
     def __init__(self, inplanes, planes, stride=1, downsample=None,
-                 stage_idx=None, layer_idx=None, warehouse_manager=None, warehouse_handover=False, drop_path=0.):
+                 stage_idx=None, layer_idx=None, warehouse_manager=None, warehouse_handover=False, drop_path=0.,
+                 feature_map_size=None):
         super(BasicBlock, self).__init__()
         conv1_stage_idx = max(stage_idx - 1 if warehouse_handover else stage_idx, 0)
+        
+        conv1_fmap_size = feature_map_size
+        conv2_fmap_size = feature_map_size if stride == 1 else feature_map_size // stride
+
         self.conv1 = kwconv3x3(inplanes, planes, stride,
-                               warehouse_name='stage{}_layer{}_conv{}'.format(conv1_stage_idx, layer_idx, 0),
-                               warehouse_manager=warehouse_manager)
+                               warehouse_name=f'stage{conv1_stage_idx}_layer{layer_idx}_conv0',
+                               warehouse_manager=warehouse_manager,
+                               feature_map_size=conv1_fmap_size)
         self.bn1 = nn.BatchNorm2d(planes)
         self.relu = nn.ReLU(inplace=True)
         layer_idx = 0 if warehouse_handover else layer_idx
         self.conv2 = kwconv3x3(planes, planes,
-                               warehouse_name='stage{}_layer{}_conv{}'.format(stage_idx, layer_idx, 1),
-                               warehouse_manager=warehouse_manager)
+                               warehouse_name=f'stage{stage_idx}_layer{layer_idx}_conv1',
+                               warehouse_manager=warehouse_manager,
+                               feature_map_size=conv2_fmap_size)
         self.bn2 = nn.BatchNorm2d(planes)
         self.downsample = downsample
         self.stride = stride
@@ -63,7 +69,7 @@ class Bottleneck(nn.Module):
         conv1_stage_idx = stage_idx - 1 if warehouse_handover else stage_idx
         self.conv1 = kwconv1x1(inplanes, planes,
                                warehouse_name='stage{}_layer{}_conv{}'.format(conv1_stage_idx, layer_idx, 0),
-                               warehouse_manager=warehouse_manager, enabled=(conv1_stage_idx >= 0))
+                               warehouse_manager=warehouse_manager, enabled=(conv1_stage_idx >= 0),)
         self.bn1 = nn.BatchNorm2d(planes)
         layer_idx = 0 if warehouse_handover else layer_idx
         self.conv2 = kwconv3x3(planes, planes, stride,
@@ -103,25 +109,26 @@ class Bottleneck(nn.Module):
 @register_model
 class KW_ResNet(nn.Module):
     def __init__(self, block, layers, num_classes=1000, dropout=0.1, reduction=0.0625,
-                 cell_num_ratio=1, cell_inplane_ratio=1, cell_outplane_ratio=1,
+                 cell_num_ratio=1, cell_inplane_ratio=1, cell_outplane_ratio=1,num_fourier_basis=[9,9,9,9],
                  sharing_range=('layer', 'conv'), nonlocal_basis_ratio=1, drop_path_rate=0., **kwargs):
         super(KW_ResNet, self).__init__()
         self.warehouse_manager = Warehouse_Manager(reduction, cell_num_ratio, cell_inplane_ratio, cell_outplane_ratio,
-                                                   sharing_range, nonlocal_basis_ratio)
+                                                   sharing_range, nonlocal_basis_ratio,num_fourier_basis)
         self.inplanes = 64
         self.layer_idx = 0
         self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = nn.BatchNorm2d(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        current_feature_map_size = 56
         self.layer1 = self._make_layer(block, 64, layers[0],
-                                       stage_idx=0, warehouse_manager=self.warehouse_manager, drop_path=drop_path_rate)
+                                       stage_idx=0,feature_map_size=current_feature_map_size, warehouse_manager=self.warehouse_manager, drop_path=drop_path_rate)
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
-                                       stage_idx=1, warehouse_manager=self.warehouse_manager, drop_path=drop_path_rate)
+                                       stage_idx=1,feature_map_size=current_feature_map_size, warehouse_manager=self.warehouse_manager, drop_path=drop_path_rate)
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2,
-                                       stage_idx=2, warehouse_manager=self.warehouse_manager, drop_path=drop_path_rate)
+                                       stage_idx=2,feature_map_size=current_feature_map_size, warehouse_manager=self.warehouse_manager, drop_path=drop_path_rate)
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
-                                       stage_idx=3, warehouse_manager=self.warehouse_manager, drop_path=drop_path_rate)
+                                       stage_idx=3, feature_map_size=current_feature_map_size, warehouse_manager=self.warehouse_manager, drop_path=drop_path_rate)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.dropout = nn.Dropout(p=dropout)
         self.fc = nn.Linear(512 * block.expansion, num_classes)
@@ -136,24 +143,24 @@ class KW_ResNet(nn.Module):
         self.warehouse_manager.store()
         self.warehouse_manager.allocate(self)
 
-    def _make_layer(self, block, planes, blocks, stride=1, stage_idx=-1, warehouse_manager=None, drop_path=0.):
+    def _make_layer(self, block, planes, blocks, stride=1, stage_idx=-1, feature_map_size=None,warehouse_manager=None, drop_path=0.):
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
                 warehouse_manager.reserve(
-                    self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, padding=0,
+                    self.inplanes, planes * block.expansion, kernel_size=1,feature_map_size=feature_map_size, stride=stride, padding=0,
                     warehouse_name='stage{}_layer{}_conv{}'.format(stage_idx - 1, self.layer_idx + 1, 0),
                     enabled=(stride != 1), bias=False),
                 nn.BatchNorm2d(planes * block.expansion),
             )
 
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample, stage_idx=stage_idx, layer_idx=self.layer_idx,
+        layers.append(block(self.inplanes, planes, stride, downsample, stage_idx=stage_idx, layer_idx=self.layer_idx,feature_map_size=feature_map_size,
                             warehouse_manager=warehouse_manager, warehouse_handover=True, drop_path=drop_path))
         self.layer_idx = 1
         self.inplanes = planes * block.expansion
         for idx in range(1, blocks):
-            layers.append(block(self.inplanes, planes, stage_idx=stage_idx, layer_idx=self.layer_idx,
+            layers.append(block(self.inplanes, planes, stage_idx=stage_idx, layer_idx=self.layer_idx,feature_map_size=feature_map_size,
                                 warehouse_manager=warehouse_manager, drop_path=drop_path))
             self.layer_idx += 1
         return nn.Sequential(*layers)
