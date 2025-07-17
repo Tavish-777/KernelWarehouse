@@ -6,6 +6,7 @@ from itertools import repeat
 import collections.abc
 import math
 from functools import partial
+import numpy as np
 
 
 def parse(x, n):
