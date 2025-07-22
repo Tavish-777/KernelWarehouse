@@ -402,6 +402,7 @@ class Warehouse_Manager(nn.Module):
         self.norm_layer = norm_layer
         self.nonlocal_basis_ratio = nonlocal_basis_ratio
         self.num_fourier_basis = num_fourier_basis
+        self.warehouse_metadata = []
 
     def fuse_warehouse_name(self, warehouse_name):
         fused_names = []
@@ -435,7 +436,7 @@ class Warehouse_Manager(nn.Module):
             self.register_buffer(buffer_name, basis)
             return basis
     def reserve(self, in_planes, out_planes, kernel_size=1, stride=1, padding=0, dilation=1, groups=1,
-                bias=True, warehouse_name='default', enabled=True, layer_type='conv2d'):
+                bias=True, warehouse_name='default', enabled=True, layer_type='conv2d',feature_map_size=None):
         """
         Create a dynamic convolution layer without convolutional weights and record its information.
         Args:
@@ -460,6 +461,7 @@ class Warehouse_Manager(nn.Module):
 
             if warehouse_name not in self.warehouse_list.keys():
                 self.warehouse_list[warehouse_name] = []
+                self.warehouse_metadata.append({'name': warehouse_name, 'feature_map_size': feature_map_size})
             self.warehouse_list[warehouse_name].append(weight_shape)
 
             return layer_type(in_planes, out_planes, kernel_size, stride=stride, padding=padding,
@@ -476,11 +478,12 @@ class Warehouse_Manager(nn.Module):
         self.cell_inplane_ratio = parse(self.cell_inplane_ratio, len(warehouse_names))
         self.num_fourier_basis = parse(self.num_fourier_basis, len(warehouse_names))
         self.weights = nn.ParameterList()
+        self.fourier_kernel_weights = nn.ParameterList()
         self.fourier_bases = []
-
         for idx, warehouse_name in enumerate(self.warehouse_list.keys()):
             warehouse = self.warehouse_list[warehouse_name]
             dimension = len(warehouse[0]) - 2
+            num_basis = self.num_fourier_basis[idx]
 
             # Calculate the greatest common divisors
             out_plane_gcd, in_plane_gcd, kernel_size = warehouse[0][0], warehouse[0][1], warehouse[0][2:]
@@ -509,7 +512,23 @@ class Warehouse_Manager(nn.Module):
             self.weights.append(nn.Parameter(torch.randn(
                 max(int(num_total_mixtures * self.cell_num_ratio[idx]), 1),
                 cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True))
-
+            num_basis = self.num_fourier_basis[idx]
+            if num_basis > 0:
+                metadata = self.warehouse_metadata[idx]
+                fmap_size = metadata['feature_map_size']
+                if fmap_size is None:
+                    raise ValueError(f"Feature map size for warehouse '{warehouse_name}' was not provided.")
+                
+                H, W = (fmap_size, fmap_size) if isinstance(fmap_size, int) else fmap_size
+                
+                print(f"INFO: WM creating Fourier basis for warehouse {idx} ('{warehouse_name}') size {H}x{W}")
+                basis = legendre_basis(H, W, num_basis, device='cpu')
+                
+                basis_container = nn.Module()
+                basis_container.register_buffer('basis', basis)
+                self.fourier_bases.append(basis_container)
+            else:
+                self.fourier_bases.append(nn.Identity())
     def allocate(self, network, _init_weights=partial(nn.init.kaiming_normal_, mode='fan_out', nonlinearity='relu')):
         num_warehouse = len(self.weights)
         parsed_num_fourier_basis = parse(self.num_fourier_basis, num_warehouse)
@@ -551,6 +570,10 @@ class Warehouse_Manager(nn.Module):
 
     def take_cell(self, warehouse_idx):
         return self.weights[warehouse_idx]
-    def take_fourier_basis(self, warehouse_idx):
-        return self.fourier_bases[warehouse_idx]
+    def take_fourier_basis(self, warehouse_id):
+        if warehouse_id < len(self.fourier_bases):
+            basis_container = self.fourier_bases[warehouse_id]
+            if isinstance(basis_container, nn.Identity): return None
+            return basis_container.basis
+        return None
 
