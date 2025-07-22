@@ -31,7 +31,7 @@ def format_bytes(size):
     return f"{size:.2f} {power_labels[n]}B"
 
 class Attention(nn.Module):
-    def __init__(self, in_planes, reduction, num_static_cell, num_local_mixture,num_fourier_basis, norm_layer=nn.BatchNorm1d,
+    def __init__(self, in_planes, reduction, num_static_cell, num_local_mixture,num_fourier_basis, norm_layer=nn.LayerNorm,
                  cell_num_ratio=1.0, nonlocal_basis_ratio=1.0, start_cell_idx=None):
         super(Attention, self).__init__()
         hidden_planes = max(int(in_planes * reduction), 16)
@@ -177,14 +177,13 @@ class KWconvNd(nn.Module):
         self.bias = nn.Parameter(torch.zeros([self.out_planes]), requires_grad=True).float() if bias else None
         self.warehouse_id = warehouse_id
         self.warehouse_manager = [warehouse_manager]  # avoid repeat registration for warehouse manager
-        self.num_fourier_basis = 9
         self.fourier_basis_created = False
+        self.num_fourier_basis = 1 
         self.fourier_coefficient_generator = None
-        if self.num_fourier_basis > 0:
-            self.pointwise_mixer = nn.Conv2d(
-                self.in_planes, self.out_planes, kernel_size=1, 
-                stride=1, padding=0, groups=self.groups, bias=False
-            )
+        self.pointwise_mixer = nn.Conv2d(
+            self.in_planes, self.out_planes, kernel_size=1, 
+            stride=1, padding=0, groups=self.groups, bias=False
+        )
     def init_attention(self, cell, num_total_attention_targets, num_fourier_basis, start_cell_idx, reduction, 
                          cell_num_ratio, norm_layer, nonlocal_basis_ratio=1.0):
         
@@ -226,11 +225,11 @@ class KWconvNd(nn.Module):
             # 输入维度是 num_local_mixture * num_fourier_basis
             # 这是 kw_attention_fourier 的展平维度
             generator_in_dim = num_local_mixture * self.num_fourier_basis
-            
+            self.fourier_path_gamma = nn.Parameter(torch.zeros(1, self.out_planes, 1, 1))
             # 输出维度是我们需要的系数总数
             # 我们为每个 (输出通道, 输入通道/组) 生成 k 个系数
             generator_out_dim = self.out_planes * (self.in_planes // self.groups) * self.num_fourier_basis
-            
+            self.pointwise_mixer_bn = nn.BatchNorm2d(self.out_planes)
             # 创建一个简单的线性层作为系数生成器
             self.fourier_coefficient_generator = nn.Sequential(
                 nn.Linear(generator_in_dim, generator_out_dim),
@@ -238,31 +237,24 @@ class KWconvNd(nn.Module):
                 # nn.LayerNorm(generator_out_dim) 
             )
         return self.attention.init_temperature(start_cell_idx, cell_num_ratio)
-    # def _create_local_fourier_basis_if_needed(self, patch_size, device):
-    #     """
-    #     一个惰性初始化函数，在第一次前向传播时创建局部的、共享的频域基。
-    #     """
-    #     # 只有在需要且尚未创建时才执行
-    #     if self.num_fourier_basis > 0 and not self.fourier_basis_created:
-    #         # 调用辅助函数创建基，尺寸为 patch_size x patch_size
-    #         basis = legendre_basis(patch_size, patch_size, self.num_fourier_basis, device=device)
-    #         # 使用 register_buffer 将其注册为模块的一部分。
-    #         # 这样它会随 .to(device) 移动，并且不会被当成可训练参数。
-    #         self.register_buffer('local_fourier_basis', basis)
-    #         self.fourier_basis_created = True
-    def _create_global_fourier_basis_if_needed(self, H, W, device):
+    def _create_local_fourier_basis_if_needed(self, patch_size, device):
         """
-        惰性初始化全局的、共享的频域基。
+        一个惰性初始化函数，在第一次前向传播时创建局部的、共享的频域基。
         """
+        # 只有在需要且尚未创建时才执行
         if self.num_fourier_basis > 0 and not self.fourier_basis_created:
-            basis = legendre_basis(H, W, self.num_fourier_basis, device=device)
-            self.register_buffer('fourier_basis', basis)
+            # 调用辅助函数创建基，尺寸为 patch_size x patch_size
+            basis = legendre_basis(patch_size, patch_size, self.num_fourier_basis, device=device)
+            # 使用 register_buffer 将其注册为模块的一部分。
+            # 这样它会随 .to(device) 移动，并且不会被当成可训练参数。
+            self.register_buffer('local_fourier_basis', basis)
             self.fourier_basis_created = True
+
     def forward(self, x):
         kw_attention ,kw_attention_fourier = self.attention(x)
         # 前 num_fourier_cells 个权重给频域细胞
-        patch_size = 7
-        self._create_global_fourier_basis_if_needed(H, W, x.device)
+        patch_size = 10
+        self._create_local_fourier_basis_if_needed(patch_size, x.device)
         batch_size ,C_in,H,W= x.shape
         output = 0.0
         device = x.device
@@ -285,70 +277,57 @@ class KWconvNd(nn.Module):
             output = output + output_spatial
 
         output_fourier = None
+
         if self.num_fourier_basis > 0 and kw_attention_fourier is not None:
+            B, C_in, H, W = x.shape
             
-            # --- Part 1: 逐通道动态谱滤波 (Depthwise Spectral Filtering) ---
-
-            # a. 全局 FFT
-            x_ft = torch.fft.rfft2(x, s=(H, W), norm='ortho')
-
-            # b. 动态生成 Depthwise 系数 (与局部方案相同)
-            coefficients_real = kw_attention_fourier.reshape(
-                batch_size, self.in_planes, self.num_fourier_basis
-            )
-            coefficients = torch.complex(coefficients_real, torch.zeros_like(coefficients_real))
+            # --- 1. 向 Manager 请求一个与当前 H, W 完全匹配的基 ---
+            manager = self.warehouse_manager[0]
+            fourier_basis = manager.get_or_create_fourier_basis(self.warehouse_id, H, W, x.device)
             
-            # c. 合成共享的 Depthwise 全局频域核
-            # fourier_basis 形状: [k, H, W_f]
-            # coefficients  形状: [B, i, k]
-            # -> kernel_ft_dw 形状: [B, i, H, W_f] (没有 C_out, 显存可控!)
-            fourier_basis = self.warehouse_manager[0].take_fourier_basis(self.warehouse_id)
-            kernel_ft_dw = torch.einsum("bik,khw->bihw", coefficients, fourier_basis)
+            if fourier_basis is not None:
+                # 2. 全局 FFT
+                x_ft = torch.fft.rfft2(x, s=(H, W), norm='ortho')
 
-            # d. 执行 Depthwise 滤波 (高效并行)
-            # x_ft:         [B, i, H, W_f]
-            # kernel_ft_dw: [B, i, H, W_f]
-            # 直接逐元素相乘，利用高效广播
-            output_ft_dw = x_ft * kernel_ft_dw
-            
-            # e. 逆 FFT
-            output_fourier_dw = torch.fft.irfft2(output_ft_dw, s=(H, W), norm='ortho')
-            # 输出形状: [B, C_in, H, W]
+                # 3. 动态生成 Depthwise 系数
+                coefficients_real = kw_attention_fourier.reshape(B, self.in_planes, self.num_fourier_basis)
+                coefficients = torch.complex(coefficients_real, torch.zeros_like(coefficients_real))
+                
+                # 4. 合成 Depthwise 全局频域核
+                # 此时 fourier_basis 的尺寸与 x_ft 保证匹配！
+                kernel_ft_dw = torch.einsum("bik,khw->bihw", coefficients, fourier_basis)
 
-            # --- Part 2: 逐点通道混合 (Pointwise Channel Mixing) ---
-            
-            # f. 使用固定的 1x1 卷积进行通道混合
-            # 注意: 这里我们使用一个固定的 1x1 Conv，因为它更简单且与您的框架最兼容
-            # 如果您已经实现了动态的 pointwise_mixer，也可以用那个
-            output_fourier_mixed = self.pointwise_mixer(output_fourier_dw)
-            # 输出形状: [B, C_out, H, W]
-            
-            # --- Part 3: 处理步长 (在频域中) ---
-
-            output_fourier = output_fourier_mixed
-            is_strided = any(s > 1 for s in self.stride)
-            if is_strided:
-                if self.dimension == 2:
-                    output_fourier = F.avg_pool2d(output_fourier, kernel_size=self.stride, stride=self.stride)
-                elif self.dimension == 1:
-                    output_fourier = F.avg_pool1d(output_fourier, kernel_size=self.stride[0], stride=self.stride[0])
+                # 5. 执行 Depthwise 滤波
+                output_ft_dw = x_ft * kernel_ft_dw
+                is_strided = any(s > 1 for s in self.stride)
+                if is_strided:
+                    H_out = H // self.stride[0]
+                    W_out = W // self.stride[1]
+                    W_out_f = W_out // 2 + 1
+                    # 只保留与目标输出尺寸对应的低频部分
+                    output_ft_dw = output_ft_dw[..., :H_out, :W_out_f]
+                    # IFFT的目标尺寸也变为小尺寸
+                    target_s = (H_out, W_out)
+                else:
+                    target_s = (H, W)
+                # 6. 逆FFT
+                output_fourier_dw = torch.fft.irfft2(output_ft_dw, s=target_s, norm='ortho')
+                output_fourier_mixed = self.pointwise_mixer_bn(self.pointwise_mixer(output_fourier_dw))
+                
+                # 8. 处理步长
+                output_fourier = output_fourier_mixed
 
         # --- 最终融合 ---
         if output_spatial is not None and output_fourier is not None:
             assert output_spatial.shape == output_fourier.shape, \
                    f"Shape mismatch: spatial {output_spatial.shape} vs fourier {output_fourier.shape}"
-            output = output_spatial + output_fourier
+            # 使用可学习的 gamma 进行稳定融合
+            # output = output_spatial + self.fourier_path_gamma * output_fourier
         elif output_spatial is not None:
             output = output_spatial
         elif output_fourier is not None:
             output = output_fourier
         else:
-            # 至少有一条路径应该被执行
-            # 如果两条路径都可能不执行，需要一个默认的零输出来处理
-            # 比如，返回一个形状正确但全为0的张量
-            # H_out, W_out = H // self.stride[0], W // self.stride[1]
-            # output = torch.zeros((batch_size, self.out_planes, H_out, W_out), device=x.device)
-            # 这里我们假设至少有一条路径会被执行
             raise ValueError("Both spatial and fourier paths are disabled, which is not expected.")
 
         # 添加偏置
@@ -423,7 +402,6 @@ class Warehouse_Manager(nn.Module):
         self.norm_layer = norm_layer
         self.nonlocal_basis_ratio = nonlocal_basis_ratio
         self.num_fourier_basis = num_fourier_basis
-        self.warehouse_metadata = []
 
     def fuse_warehouse_name(self, warehouse_name):
         fused_names = []
@@ -435,9 +413,29 @@ class Warehouse_Manager(nn.Module):
             fused_names.append(match_name)
         fused_names = '_'.join(fused_names)
         return fused_names
-
+    def get_or_create_fourier_basis(self, warehouse_id, H, W, device):
+        """
+        这个方法现在是创建和获取 basis 的唯一入口。
+        """
+        # 解析每个stage的basis数量
+        parsed_num_fourier_basis = parse(self.num_fourier_basis, len(self.weights))
+        num_basis = self.num_fourier_basis[warehouse_id]
+        if num_basis <= 0: return None
+        
+        # 创建一个与尺寸和stage都相关的、唯一的 buffer 名称
+        buffer_name = f'fourier_basis_w{warehouse_id}_{H}x{W}'
+        
+        # 检查 buffer 是否已存在于 manager 自身
+        if hasattr(self, buffer_name):
+            return getattr(self, buffer_name)
+        else:
+            # 创建并注册
+            print(f"INFO: WM creating and registering Buffer '{buffer_name}' on device {device}")
+            basis = legendre_basis(H, W, num_basis, device=device)
+            self.register_buffer(buffer_name, basis)
+            return basis
     def reserve(self, in_planes, out_planes, kernel_size=1, stride=1, padding=0, dilation=1, groups=1,
-                bias=True, warehouse_name='default', enabled=True, layer_type='conv2d',feature_map_size=None):
+                bias=True, warehouse_name='default', enabled=True, layer_type='conv2d'):
         """
         Create a dynamic convolution layer without convolutional weights and record its information.
         Args:
@@ -462,7 +460,6 @@ class Warehouse_Manager(nn.Module):
 
             if warehouse_name not in self.warehouse_list.keys():
                 self.warehouse_list[warehouse_name] = []
-                self.warehouse_metadata.append({'name': warehouse_name, 'feature_map_size': feature_map_size})
             self.warehouse_list[warehouse_name].append(weight_shape)
 
             return layer_type(in_planes, out_planes, kernel_size, stride=stride, padding=padding,
@@ -512,32 +509,7 @@ class Warehouse_Manager(nn.Module):
             self.weights.append(nn.Parameter(torch.randn(
                 max(int(num_total_mixtures * self.cell_num_ratio[idx]), 1),
                 cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True))
-            num_basis = self.num_fourier_basis[idx]
-            if num_basis > 0:
-                # 从元数据中获取尺寸信息
-                metadata = self.warehouse_metadata[idx]
-                fmap_size = metadata['feature_map_size']
-                if fmap_size is None:
-                    raise ValueError(f"Feature map size for warehouse '{warehouse_name}' was not provided during reserve.")
-                
-                # H 和 W 可能是一个整数，也可能是一个元组
-                if isinstance(fmap_size, int):
-                    H, W = fmap_size, fmap_size
-                else:
-                    H, W = fmap_size
-                
-                print(f"INFO: Warehouse Manager creating Fourier basis for warehouse {idx} (size {H}x{W})")
-                basis = legendre_basis(H, W, num_basis, device='cpu') # 先在CPU上创建
-                
-                # 将 basis 封装一下，以便注册为 buffer
-                class BasisWrapper(nn.Module):
-                    def __init__(self, basis_tensor):
-                        super().__init__()
-                        self.register_buffer('basis', basis_tensor)
-                
-                self.fourier_bases.append(BasisWrapper(basis))
-            else:
-                self.fourier_bases.append(None)
+
     def allocate(self, network, _init_weights=partial(nn.init.kaiming_normal_, mode='fan_out', nonlinearity='relu')):
         num_warehouse = len(self.weights)
         parsed_num_fourier_basis = parse(self.num_fourier_basis, num_warehouse)
@@ -551,7 +523,7 @@ class Warehouse_Manager(nn.Module):
                 # 空间细胞的数量由仓库决定
                 num_spatial_cells = self.weights[warehouse_idx].shape[0]
                 # 频域基的数量由配置决定
-                num_fourier_basis = parsed_num_fourier_basis[warehouse_idx]
+                num_fourier_basis = 9
                 
                 # 总的“注意力目标”数量
                 total_attention_targets = num_spatial_cells + num_fourier_basis
@@ -579,8 +551,6 @@ class Warehouse_Manager(nn.Module):
 
     def take_cell(self, warehouse_idx):
         return self.weights[warehouse_idx]
-    def take_fourier_basis(self, warehouse_id):
-        if self.fourier_bases[warehouse_id] is not None:
-            return self.fourier_bases[warehouse_id].basis
-        return None
+    def take_fourier_basis(self, warehouse_idx):
+        return self.fourier_bases[warehouse_idx]
 

@@ -114,18 +114,14 @@ class KW_ResNet(nn.Module):
         self.bn1 = nn.BatchNorm2d(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        current_feature_map_size = 56
         self.layer1 = self._make_layer(block, 64, layers[0],
-                                       stage_idx=0, warehouse_manager=self.warehouse_manager, feature_map_size=current_feature_map_size, drop_path=drop_path_rate)
-        current_feature_map_size //= 2
+                                       stage_idx=0, warehouse_manager=self.warehouse_manager, drop_path=drop_path_rate)
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
-                                       stage_idx=1, warehouse_manager=self.warehouse_manager, feature_map_size=current_feature_map_size, drop_path=drop_path_rate)
-        current_feature_map_size //= 2
+                                       stage_idx=1, warehouse_manager=self.warehouse_manager, drop_path=drop_path_rate)
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2,
-                                       stage_idx=2, warehouse_manager=self.warehouse_manager, feature_map_size=current_feature_map_size, drop_path=drop_path_rate)
-        current_feature_map_size //= 2
+                                       stage_idx=2, warehouse_manager=self.warehouse_manager, drop_path=drop_path_rate)
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
-                                       stage_idx=3, warehouse_manager=self.warehouse_manager,feature_map_size=current_feature_map_size,  drop_path=drop_path_rate)
+                                       stage_idx=3, warehouse_manager=self.warehouse_manager, drop_path=drop_path_rate)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.dropout = nn.Dropout(p=dropout)
         self.fc = nn.Linear(512 * block.expansion, num_classes)
@@ -140,13 +136,13 @@ class KW_ResNet(nn.Module):
         self.warehouse_manager.store()
         self.warehouse_manager.allocate(self)
 
-    def _make_layer(self, block, planes, blocks, stride=1, stage_idx=-1, warehouse_manager=None,feature_map_size=None, drop_path=0.):
+    def _make_layer(self, block, planes, blocks, stride=1, stage_idx=-1, warehouse_manager=None, drop_path=0.):
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = nn.Sequential(
                 warehouse_manager.reserve(
                     self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, padding=0,
-                    warehouse_name='stage{}_layer{}_conv{}'.format(stage_idx - 1, self.layer_idx + 1, 0),feature_map_size=feature_map_size,
+                    warehouse_name='stage{}_layer{}_conv{}'.format(stage_idx - 1, self.layer_idx + 1, 0),
                     enabled=(stride != 1), bias=False),
                 nn.BatchNorm2d(planes * block.expansion),
             )
