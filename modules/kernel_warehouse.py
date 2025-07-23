@@ -371,7 +371,7 @@ class KWLinear(nn.Module):
 class Warehouse_Manager(nn.Module):
     def __init__(self, reduction=0.0625, cell_num_ratio=1, cell_inplane_ratio=1,
                  cell_outplane_ratio=1, sharing_range=(), nonlocal_basis_ratio=1,
-                 norm_layer=nn.BatchNorm1d, spatial_partition=True,num_fourier_basis=9):
+                 norm_layer=nn.BatchNorm1d, spatial_partition=True,num_fourier_basis=9,fourier_basis_ratio=1.0):
         """
         Create a Kernel Warehouse manager for a network.
         Args:
@@ -402,7 +402,8 @@ class Warehouse_Manager(nn.Module):
         self.norm_layer = norm_layer
         self.nonlocal_basis_ratio = nonlocal_basis_ratio
         self.num_fourier_basis = num_fourier_basis
-
+        self.fourier_basis_ratio = fourier_basis_ratio
+        self.num_fourier_basis_per_warehouse = []
     def fuse_warehouse_name(self, warehouse_name):
         fused_names = []
         for sub_name in warehouse_name.split('_'):
@@ -414,23 +415,15 @@ class Warehouse_Manager(nn.Module):
         fused_names = '_'.join(fused_names)
         return fused_names
     def get_or_create_fourier_basis(self, warehouse_id, H, W, device):
-        """
-        这个方法现在是创建和获取 basis 的唯一入口。
-        """
-        # 解析每个stage的basis数量
-        parsed_num_fourier_basis = parse(self.num_fourier_basis, len(self.weights))
-        num_basis = self.num_fourier_basis[warehouse_id]
+        # 使用存储好的数量
+        num_basis = self.num_fourier_basis_per_warehouse[warehouse_id]
         if num_basis <= 0: return None
-        
-        # 创建一个与尺寸和stage都相关的、唯一的 buffer 名称
         buffer_name = f'fourier_basis_w{warehouse_id}_{H}x{W}'
         
-        # 检查 buffer 是否已存在于 manager 自身
         if hasattr(self, buffer_name):
             return getattr(self, buffer_name)
         else:
-            # 创建并注册
-            print(f"INFO: WM creating and registering Buffer '{buffer_name}' on device {device}")
+            print(f"INFO: WM creating and registering Buffer '{buffer_name}' with {num_basis} bases on device {device}")
             basis = legendre_basis(H, W, num_basis, device=device)
             self.register_buffer(buffer_name, basis)
             return basis
@@ -475,8 +468,9 @@ class Warehouse_Manager(nn.Module):
         self.cell_outplane_ratio = parse(self.cell_outplane_ratio, len(warehouse_names))
         self.cell_inplane_ratio = parse(self.cell_inplane_ratio, len(warehouse_names))
         self.num_fourier_basis = parse(self.num_fourier_basis, len(warehouse_names))
+        self.fourier_basis_ratio = parse(self.fourier_basis_ratio, len(self.warehouse_names))
         self.weights = nn.ParameterList()
-        self.fourier_bases = []
+        self.num_fourier_basis_per_warehouse = []
 
         for idx, warehouse_name in enumerate(self.warehouse_list.keys()):
             warehouse = self.warehouse_list[warehouse_name]
@@ -505,11 +499,17 @@ class Warehouse_Manager(nn.Module):
 
                 num_layer_mixtures = groups_spatial * groups_channel
                 num_total_mixtures += num_layer_mixtures
-
+            num_spatial_cells = max(int(num_total_mixtures * self.cell_num_ratio[idx]), 1)
             self.weights.append(nn.Parameter(torch.randn(
                 max(int(num_total_mixtures * self.cell_num_ratio[idx]), 1),
                 cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True))
-
+            ratio = self.fourier_basis_ratio[idx]
+            if ratio > 0:
+                num_basis = max(int(num_spatial_cells * ratio), 1)
+                self.num_fourier_basis_per_warehouse.append(num_basis)
+                print(f"INFO: WM configured warehouse {idx} to have {num_basis} Fourier basis (ratio={ratio})")
+            else:
+                self.num_fourier_basis_per_warehouse.append(0)
     def allocate(self, network, _init_weights=partial(nn.init.kaiming_normal_, mode='fan_out', nonlinearity='relu')):
         num_warehouse = len(self.weights)
         parsed_num_fourier_basis = parse(self.num_fourier_basis, num_warehouse)
@@ -553,4 +553,3 @@ class Warehouse_Manager(nn.Module):
         return self.weights[warehouse_idx]
     def take_fourier_basis(self, warehouse_idx):
         return self.fourier_bases[warehouse_idx]
-
