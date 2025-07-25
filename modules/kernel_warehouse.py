@@ -31,7 +31,7 @@ def format_bytes(size):
     return f"{size:.2f} {power_labels[n]}B"
 
 class Attention(nn.Module):
-    def __init__(self, in_planes, reduction, num_static_cell, num_local_mixture,num_fourier_basis, norm_layer=nn.BatchNorm1d,
+    def __init__(self, in_planes, reduction, num_static_cell, num_local_mixture,num_fourier_basis, num_frequency_mixtures,norm_layer=nn.BatchNorm1d,
                  cell_num_ratio=1.0, nonlocal_basis_ratio=1.0, start_cell_idx=None):
         super(Attention, self).__init__()
         hidden_planes = max(int(in_planes * reduction), 16)
@@ -65,9 +65,9 @@ class Attention(nn.Module):
         self.temp_value = 0
         self._initialize_weights()
         if self.fourier_enabled:
-            self.fourier_head = nn.Linear(hidden_planes, self.num_fourier_basis * in_planes, bias=True)
+            self.kw_planes_fourier = in_planes * num_frequency_mixtures * (num_fourier_basis + 1)
+            self.fourier_head = nn.Linear(hidden_planes, self.kw_planes_fourier, bias=True)
         if self.spatial_enabled:
-            
             self.spatial_head = nn.Linear(hidden_planes, self.kw_planes, bias=True)
     def _initialize_weights(self):
         for m in self.modules():
@@ -186,6 +186,7 @@ class KWconvNd(nn.Module):
                          cell_num_ratio, norm_layer, nonlocal_basis_ratio=1.0):
         
         self.cell_shape = cell.shape 
+        self.num_frequency_mixtures = 16 
         self.num_fourier_basis = num_fourier_basis
         self.num_spatial_cells = self.cell_shape[0] 
         
@@ -211,7 +212,8 @@ class KWconvNd(nn.Module):
             num_static_cell=self.num_spatial_cells,
             num_local_mixture=num_local_mixture,
             # 频域路径参数
-            num_fourier_basis=self.num_fourier_basis,
+            num_fourier_basis=num_fourier_basis,
+            num_frequency_mixtures=self.num_frequency_mixtures,
             # 其他
             norm_layer=norm_layer,
             nonlocal_basis_ratio=nonlocal_basis_ratio,
@@ -268,17 +270,57 @@ class KWconvNd(nn.Module):
             if fourier_basis is not None:
                 # 2. 全局 FFT
                 x_ft = torch.fft.rfft2(x, s=(H, W), norm='ortho')
-
+                W_f = W // 2 + 1
                 # 3. 动态生成 Depthwise 系数
-                coefficients_real = kw_attention_fourier.reshape(B, self.in_planes, self.num_fourier_basis)
-                coefficients = torch.complex(coefficients_real, torch.zeros_like(coefficients_real))
+                total_num_fourier_basis = self.num_fourier_basis + 1
+                coefficients_real_raw = kw_attention_fourier.reshape(
+                    B, C_in, self.num_frequency_mixtures, total_num_fourier_basis
+                )
                 
-                # 4. 合成 Depthwise 全局频域核
-                # 此时 fourier_basis 的尺寸与 x_ft 保证匹配！
-                kernel_ft_dw = torch.einsum("bik,khw->bihw", coefficients, fourier_basis)
+                coefficients = torch.softmax(coefficients_real_raw, dim=-1)
+                coefficients = torch.complex(coefficients, torch.zeros_like(coefficients))
+                # mix_h, mix_w = int(np.sqrt(self.num_frequency_mixtures)), int(np.sqrt(self.num_frequency_mixtures))
+                # patch_h, patch_w = H // mix_h, W_f // mix_w
+                # basis_patched = fourier_basis.unfold(1, patch_h, patch_h).unfold(2, patch_w, patch_w)
+                # basis_patched = basis_patched.permute(1, 2, 0, 3, 4).reshape(self.num_frequency_mixtures, self.num_fourier_basis + 1, patch_h, patch_w)
+                # kernel_ft_patched = torch.einsum("bimk,mk...->bim...", coefficients, basis_patched)
+                # kernel_ft_patched = kernel_ft_patched.reshape(B, C_in, mix_h, mix_w, patch_h, patch_w)
+                # kernel_ft_dw = kernel_ft_patched.permute(0, 1, 2, 4, 3, 5).reshape(B, C_in, H, W_f)
+                mix_h = int(np.sqrt(self.num_frequency_mixtures))
+                mix_w = int(np.sqrt(self.num_frequency_mixtures))
+                
+                H_crop = (H // mix_h) * mix_h
+                W_f_crop = (W_f // mix_w) * mix_w
+                
+                # --- 2. 只在工作区内进行所有操作 ---
+                
+                # a. 准备工作区内的基块
+                basis_cropped = fourier_basis[..., :H_crop, :W_f_crop]
+                patch_h = H_crop // mix_h
+                patch_w_f = W_f_crop // mix_w
+                basis_reshaped = basis_cropped.reshape(total_num_fourier_basis, mix_h, patch_h, mix_w, patch_w_f)
+                basis_permuted = basis_reshaped.permute(1, 3, 0, 2, 4).contiguous()
+                basis_patched = basis_permuted.reshape(self.num_frequency_mixtures, total_num_fourier_basis, patch_h, patch_w_f)
 
+                # b. 准备工作区内的输入块
+                x_ft_cropped = x_ft[..., :H_crop, :W_f_crop]
+                x_ft_reshaped = x_ft_cropped.reshape(B, C_in, mix_h, patch_h, mix_w, patch_w_f)
+                x_ft_permuted = x_ft_reshaped.permute(0, 2, 4, 1, 3, 5).contiguous()
+                x_ft_patched = x_ft_permuted.reshape(B, self.num_frequency_mixtures, C_in, patch_h, patch_w_f)
+
+                # c. 合成与滤波
+                kernel_patched = torch.einsum("bimk,mk...->bim...", coefficients, basis_patched)
+                output_ft_patched = x_ft_patched * kernel_patched.permute(0, 2, 1, 3, 4)
+                
+                # d. 拼接回工作区大小
+                output_ft_cropped = output_ft_patched.reshape(B, mix_h, mix_w, C_in, patch_h, patch_w_f)
+                output_ft_cropped = output_ft_cropped.permute(0, 3, 1, 4, 2, 5).contiguous()
+                output_ft_cropped = output_ft_cropped.reshape(B, C_in, H_crop, W_f_crop)
+
+                # --- 3. 将工作区的结果放回完整尺寸的零张量中 ---
+                output_ft_dw = torch.zeros_like(x_ft)
+                output_ft_dw[..., :H_crop, :W_f_crop] = output_ft_cropped
                 # 5. 执行 Depthwise 滤波
-                output_ft_dw = x_ft * kernel_ft_dw
                 is_strided = any(s > 1 for s in self.stride)
                 if is_strided:
                     H_out = H // self.stride[0]
@@ -394,18 +436,33 @@ class Warehouse_Manager(nn.Module):
         fused_names = '_'.join(fused_names)
         return fused_names
     def get_or_create_fourier_basis(self, warehouse_id, H, W, device):
-        # 使用存储好的数量
+        # ... (获取 num_basis 的逻辑不变) ...
         num_basis = self.num_fourier_basis_per_warehouse[warehouse_id]
         if num_basis <= 0: return None
+        
         buffer_name = f'fourier_basis_w{warehouse_id}_{H}x{W}'
         
         if hasattr(self, buffer_name):
             return getattr(self, buffer_name)
         else:
-            print(f"INFO: WM creating and registering Buffer '{buffer_name}' with {num_basis} bases on device {device}")
-            basis = legendre_basis(H, W, num_basis, device=device)
-            self.register_buffer(buffer_name, basis)
-            return basis
+            print(f"INFO: WM creating Buffer '{buffer_name}' with {num_basis}+1 bases...")
+            
+            # 1. 创建 k 个勒让德基
+            legendre_bases = legendre_basis(H, W, num_basis, device=device)
+            # 形状: [k, H, W_f]
+            
+            # b. 创建一个固定的、不可学习的全零基元
+            zero_basis = torch.zeros(1, H, W // 2 + 1, dtype=torch.cfloat, device=device)
+            
+            # c. 将它们拼接在一起，形成最终的基
+            # final_basis 的形状是 [k+1, H, W_f]
+            final_basis = torch.cat([legendre_bases, zero_basis], dim=0)
+
+            # d. 将这个拼接好的、完整的基注册为 buffer
+            self.register_buffer(buffer_name, final_basis)
+            
+            # 返回创建好的基和总数
+            return final_basis
     def reserve(self, in_planes, out_planes, kernel_size=1, stride=1, padding=0, dilation=1, groups=1,
                 bias=True, warehouse_name='default', enabled=True, layer_type='conv2d'):
         """
@@ -438,20 +495,6 @@ class Warehouse_Manager(nn.Module):
                               dilation=dilation, groups=groups, bias=bias,
                               warehouse_id=int(list(self.warehouse_list.keys()).index(warehouse_name)),
                               warehouse_manager=self)
-    def get_or_create_fourier_basis(self, warehouse_id, H, W, device):
-        # 使用存储好的数量
-        num_basis = self.num_fourier_basis_per_warehouse[warehouse_id]
-        if num_basis <= 0: return None
-        
-        buffer_name = f'fourier_basis_w{warehouse_id}_{H}x{W}'
-        
-        if hasattr(self, buffer_name):
-            return getattr(self, buffer_name)
-        else:
-            print(f"INFO: WM creating and registering Buffer '{buffer_name}' with {num_basis} bases on device {device}")
-            basis = legendre_basis(H, W, num_basis, device=device)
-            self.register_buffer(buffer_name, basis)
-            return basis
     def store(self):
         warehouse_names = list(self.warehouse_list.keys())
         self.reduction = parse(self.reduction, len(warehouse_names))
