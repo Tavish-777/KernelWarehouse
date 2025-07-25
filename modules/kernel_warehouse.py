@@ -65,7 +65,6 @@ class Attention(nn.Module):
         self.temp_value = 0
         self._initialize_weights()
         if self.fourier_enabled:
-            
             self.fourier_head = nn.Linear(hidden_planes, self.num_fourier_basis * in_planes, bias=True)
         if self.spatial_enabled:
             
@@ -146,7 +145,6 @@ def legendre_basis(H, W, k, device):
     # 使用 numpy 的勒让德多项式函数来计算
     # i, j 是多项式的阶数
     for i in range(k):
-        # 简单起见，我们只用一维的基 P_i(x) * P_i(y)，可以扩展到 P_i(x) * P_j(y)
         p_i_y = torch.from_numpy(np.polynomial.legendre.legval(y.cpu().numpy(), [0]*i + [1])).to(device).float()
         p_i_x = torch.from_numpy(np.polynomial.legendre.legval(x.cpu().numpy(), [0]*i + [1])).to(device).float()
         
@@ -224,37 +222,19 @@ class KWconvNd(nn.Module):
         if self.num_fourier_basis > 0:
             # 输入维度是 num_local_mixture * num_fourier_basis
             # 这是 kw_attention_fourier 的展平维度
-            generator_in_dim = num_local_mixture * self.num_fourier_basis
+            
             self.fourier_path_gamma = nn.Parameter(torch.zeros(1, self.out_planes, 1, 1))
             # 输出维度是我们需要的系数总数
             # 我们为每个 (输出通道, 输入通道/组) 生成 k 个系数
-            generator_out_dim = self.out_planes * (self.in_planes // self.groups) * self.num_fourier_basis
+            
             self.pointwise_mixer_bn = nn.BatchNorm2d(self.out_planes)
             # 创建一个简单的线性层作为系数生成器
-            self.fourier_coefficient_generator = nn.Sequential(
-                nn.Linear(generator_in_dim, generator_out_dim),
-                # 可以选择性地添加激活函数或归一化层
-                # nn.LayerNorm(generator_out_dim) 
-            )
+            
         return self.attention.init_temperature(start_cell_idx, cell_num_ratio)
-    def _create_local_fourier_basis_if_needed(self, patch_size, device):
-        """
-        一个惰性初始化函数，在第一次前向传播时创建局部的、共享的频域基。
-        """
-        # 只有在需要且尚未创建时才执行
-        if self.num_fourier_basis > 0 and not self.fourier_basis_created:
-            # 调用辅助函数创建基，尺寸为 patch_size x patch_size
-            basis = legendre_basis(patch_size, patch_size, self.num_fourier_basis, device=device)
-            # 使用 register_buffer 将其注册为模块的一部分。
-            # 这样它会随 .to(device) 移动，并且不会被当成可训练参数。
-            self.register_buffer('local_fourier_basis', basis)
-            self.fourier_basis_created = True
 
     def forward(self, x):
         kw_attention ,kw_attention_fourier = self.attention(x)
         # 前 num_fourier_cells 个权重给频域细胞
-        patch_size = 10
-        self._create_local_fourier_basis_if_needed(patch_size, x.device)
         batch_size ,C_in,H,W= x.shape
         output = 0.0
         device = x.device
@@ -315,6 +295,7 @@ class KWconvNd(nn.Module):
                 output_fourier_mixed = self.pointwise_mixer_bn(self.pointwise_mixer(output_fourier_dw))
                 
                 # 8. 处理步长
+                
                 output_fourier = output_fourier_mixed
 
         # --- 最终融合 ---
@@ -322,7 +303,7 @@ class KWconvNd(nn.Module):
             assert output_spatial.shape == output_fourier.shape, \
                    f"Shape mismatch: spatial {output_spatial.shape} vs fourier {output_fourier.shape}"
             # 使用可学习的 gamma 进行稳定融合
-            # output = output_spatial + self.fourier_path_gamma * output_fourier
+            output = output_spatial + output_fourier
         elif output_spatial is not None:
             output = output_spatial
         elif output_fourier is not None:
@@ -468,7 +449,7 @@ class Warehouse_Manager(nn.Module):
         self.cell_outplane_ratio = parse(self.cell_outplane_ratio, len(warehouse_names))
         self.cell_inplane_ratio = parse(self.cell_inplane_ratio, len(warehouse_names))
         self.num_fourier_basis = parse(self.num_fourier_basis, len(warehouse_names))
-        self.fourier_basis_ratio = parse(self.fourier_basis_ratio, len(self.warehouse_names))
+        self.fourier_basis_ratio = parse(self.fourier_basis_ratio, len(warehouse_names))
         self.weights = nn.ParameterList()
         self.num_fourier_basis_per_warehouse = []
 
@@ -523,7 +504,7 @@ class Warehouse_Manager(nn.Module):
                 # 空间细胞的数量由仓库决定
                 num_spatial_cells = self.weights[warehouse_idx].shape[0]
                 # 频域基的数量由配置决定
-                num_fourier_basis = 9
+                num_fourier_basis = self.num_fourier_basis_per_warehouse[warehouse_idx]
                 
                 # 总的“注意力目标”数量
                 total_attention_targets = num_spatial_cells + num_fourier_basis
