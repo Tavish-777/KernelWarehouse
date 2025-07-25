@@ -31,7 +31,7 @@ def format_bytes(size):
     return f"{size:.2f} {power_labels[n]}B"
 
 class Attention(nn.Module):
-    def __init__(self, in_planes, reduction, num_static_cell, num_local_mixture,num_fourier_basis, norm_layer=nn.LayerNorm,
+    def __init__(self, in_planes, reduction, num_static_cell, num_local_mixture,num_fourier_basis, norm_layer=nn.BatchNorm1d,
                  cell_num_ratio=1.0, nonlocal_basis_ratio=1.0, start_cell_idx=None):
         super(Attention, self).__init__()
         hidden_planes = max(int(in_planes * reduction), 16)
@@ -293,7 +293,6 @@ class KWconvNd(nn.Module):
                 # 6. 逆FFT
                 output_fourier_dw = torch.fft.irfft2(output_ft_dw, s=target_s, norm='ortho')
                 output_fourier_mixed = self.pointwise_mixer_bn(self.pointwise_mixer(output_fourier_dw))
-                
                 # 8. 处理步长
                 
                 output_fourier = output_fourier_mixed
@@ -352,7 +351,7 @@ class KWLinear(nn.Module):
 class Warehouse_Manager(nn.Module):
     def __init__(self, reduction=0.0625, cell_num_ratio=1, cell_inplane_ratio=1,
                  cell_outplane_ratio=1, sharing_range=(), nonlocal_basis_ratio=1,
-                 norm_layer=nn.BatchNorm1d, spatial_partition=True,num_fourier_basis=9,fourier_basis_ratio=1.0):
+                 norm_layer=nn.BatchNorm1d, spatial_partition=True,fourier_basis_ratio=1.0):
         """
         Create a Kernel Warehouse manager for a network.
         Args:
@@ -382,7 +381,6 @@ class Warehouse_Manager(nn.Module):
         self.cell_inplane_ratio = cell_inplane_ratio
         self.norm_layer = norm_layer
         self.nonlocal_basis_ratio = nonlocal_basis_ratio
-        self.num_fourier_basis = num_fourier_basis
         self.fourier_basis_ratio = fourier_basis_ratio
         self.num_fourier_basis_per_warehouse = []
     def fuse_warehouse_name(self, warehouse_name):
@@ -440,7 +438,20 @@ class Warehouse_Manager(nn.Module):
                               dilation=dilation, groups=groups, bias=bias,
                               warehouse_id=int(list(self.warehouse_list.keys()).index(warehouse_name)),
                               warehouse_manager=self)
-
+    def get_or_create_fourier_basis(self, warehouse_id, H, W, device):
+        # 使用存储好的数量
+        num_basis = self.num_fourier_basis_per_warehouse[warehouse_id]
+        if num_basis <= 0: return None
+        
+        buffer_name = f'fourier_basis_w{warehouse_id}_{H}x{W}'
+        
+        if hasattr(self, buffer_name):
+            return getattr(self, buffer_name)
+        else:
+            print(f"INFO: WM creating and registering Buffer '{buffer_name}' with {num_basis} bases on device {device}")
+            basis = legendre_basis(H, W, num_basis, device=device)
+            self.register_buffer(buffer_name, basis)
+            return basis
     def store(self):
         warehouse_names = list(self.warehouse_list.keys())
         self.reduction = parse(self.reduction, len(warehouse_names))
@@ -448,7 +459,6 @@ class Warehouse_Manager(nn.Module):
         self.cell_num_ratio = parse(self.cell_num_ratio, len(warehouse_names))
         self.cell_outplane_ratio = parse(self.cell_outplane_ratio, len(warehouse_names))
         self.cell_inplane_ratio = parse(self.cell_inplane_ratio, len(warehouse_names))
-        self.num_fourier_basis = parse(self.num_fourier_basis, len(warehouse_names))
         self.fourier_basis_ratio = parse(self.fourier_basis_ratio, len(warehouse_names))
         self.weights = nn.ParameterList()
         self.num_fourier_basis_per_warehouse = []
@@ -493,7 +503,6 @@ class Warehouse_Manager(nn.Module):
                 self.num_fourier_basis_per_warehouse.append(0)
     def allocate(self, network, _init_weights=partial(nn.init.kaiming_normal_, mode='fan_out', nonlinearity='relu')):
         num_warehouse = len(self.weights)
-        parsed_num_fourier_basis = parse(self.num_fourier_basis, num_warehouse)
         end_idxs = [0] * num_warehouse
 
         for layer in network.modules():
@@ -532,5 +541,10 @@ class Warehouse_Manager(nn.Module):
 
     def take_cell(self, warehouse_idx):
         return self.weights[warehouse_idx]
-    def take_fourier_basis(self, warehouse_idx):
-        return self.fourier_bases[warehouse_idx]
+    def take_fourier_basis(self, warehouse_id):
+        if warehouse_id < len(self.fourier_bases):
+            basis_container = self.fourier_bases[warehouse_id]
+            if isinstance(basis_container, nn.Identity): return None
+            return basis_container.basis
+        return None
+
