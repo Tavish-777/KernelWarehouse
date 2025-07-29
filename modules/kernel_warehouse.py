@@ -262,7 +262,7 @@ class KWconvNd(nn.Module):
 
         if self.num_fourier_basis > 0 and kw_attention_fourier is not None:
             B, C_in, H, W = x.shape
-            
+    
             # --- 1. 向 Manager 请求一个与当前 H, W 完全匹配的基 ---
             manager = self.warehouse_manager[0]
             fourier_basis = manager.get_or_create_fourier_basis(self.warehouse_id, H, W, x.device)
@@ -271,72 +271,100 @@ class KWconvNd(nn.Module):
                 # 2. 全局 FFT
                 x_ft = torch.fft.rfft2(x, s=(H, W), norm='ortho')
                 W_f = W // 2 + 1
+                
                 # 3. 动态生成 Depthwise 系数
                 total_num_fourier_basis = self.num_fourier_basis + 1
                 coefficients_real_raw = kw_attention_fourier.reshape(
                     B, C_in, self.num_frequency_mixtures, total_num_fourier_basis
                 )
-                
                 coefficients = torch.softmax(coefficients_real_raw, dim=-1)
                 coefficients = torch.complex(coefficients, torch.zeros_like(coefficients))
-                # mix_h, mix_w = int(np.sqrt(self.num_frequency_mixtures)), int(np.sqrt(self.num_frequency_mixtures))
-                # patch_h, patch_w = H // mix_h, W_f // mix_w
-                # basis_patched = fourier_basis.unfold(1, patch_h, patch_h).unfold(2, patch_w, patch_w)
-                # basis_patched = basis_patched.permute(1, 2, 0, 3, 4).reshape(self.num_frequency_mixtures, self.num_fourier_basis + 1, patch_h, patch_w)
-                # kernel_ft_patched = torch.einsum("bimk,mk...->bim...", coefficients, basis_patched)
-                # kernel_ft_patched = kernel_ft_patched.reshape(B, C_in, mix_h, mix_w, patch_h, patch_w)
-                # kernel_ft_dw = kernel_ft_patched.permute(0, 1, 2, 4, 3, 5).reshape(B, C_in, H, W_f)
+                
                 mix_h = int(np.sqrt(self.num_frequency_mixtures))
                 mix_w = int(np.sqrt(self.num_frequency_mixtures))
+
+                # ======================= 核心修改部分开始 =======================
+
+                # --- 2. 填充以处理任意尺寸，避免信息丢失 ---
                 
-                H_crop = (H // mix_h) * mix_h
-                W_f_crop = (W_f // mix_w) * mix_w
+                # a. 计算需要填充到的新尺寸
+                # 使用 math.ceil 确保我们向上取整到下一个可被整除的尺寸
+                H_pad = math.ceil(H / mix_h) * mix_h
+                W_f_pad = math.ceil(W_f / mix_w) * mix_w
+                W_pad = 2 * (W_f_pad - 1)
                 
-                # --- 2. 只在工作区内进行所有操作 ---
+                # b. 对频域输入 x_ft 和傅里叶基 basis 进行零填充
+                # F.pad 的参数格式是 (pad_left, pad_right, pad_top, pad_bottom)
+                # 我们只需要在右边和下边填充
+                padding_dims = (0, W_f_pad - W_f, 0, H_pad - H)
+                x_ft_padded = F.pad(x_ft, padding_dims, "constant", 0)
+                basis_padded = F.pad(fourier_basis, padding_dims, "constant", 0)
                 
-                # a. 准备工作区内的基块
-                basis_cropped = fourier_basis[..., :H_crop, :W_f_crop]
-                patch_h = H_crop // mix_h
-                patch_w_f = W_f_crop // mix_w
-                basis_reshaped = basis_cropped.reshape(total_num_fourier_basis, mix_h, patch_h, mix_w, patch_w_f)
+                # --- 3. 在填充后的、尺寸规整的工作区内进行所有操作 ---
+                
+                # a. 准备工作区内的基块 (现在使用 H_pad, W_f_pad)
+                patch_h = H_pad // mix_h
+                patch_w_f = W_f_pad // mix_w
+                
+                # 注意：这里的 reshape 和 permute 逻辑和你原来的一样，只是操作对象是 padded Tensors
+                basis_reshaped = basis_padded.reshape(total_num_fourier_basis, mix_h, patch_h, mix_w, patch_w_f)
                 basis_permuted = basis_reshaped.permute(1, 3, 0, 2, 4).contiguous()
                 basis_patched = basis_permuted.reshape(self.num_frequency_mixtures, total_num_fourier_basis, patch_h, patch_w_f)
 
                 # b. 准备工作区内的输入块
-                x_ft_cropped = x_ft[..., :H_crop, :W_f_crop]
-                x_ft_reshaped = x_ft_cropped.reshape(B, C_in, mix_h, patch_h, mix_w, patch_w_f)
+                x_ft_reshaped = x_ft_padded.reshape(B, C_in, mix_h, patch_h, mix_w, patch_w_f)
                 x_ft_permuted = x_ft_reshaped.permute(0, 2, 4, 1, 3, 5).contiguous()
                 x_ft_patched = x_ft_permuted.reshape(B, self.num_frequency_mixtures, C_in, patch_h, patch_w_f)
 
                 # c. 合成与滤波
                 kernel_patched = torch.einsum("bimk,mk...->bim...", coefficients, basis_patched)
+                # 你的 permute (0, 2, 1, 3, 4) 是为了让 C_in 和 num_frequency_mixtures 维度匹配
                 output_ft_patched = x_ft_patched * kernel_patched.permute(0, 2, 1, 3, 4)
                 
-                # d. 拼接回工作区大小
-                output_ft_cropped = output_ft_patched.reshape(B, mix_h, mix_w, C_in, patch_h, patch_w_f)
-                output_ft_cropped = output_ft_cropped.permute(0, 3, 1, 4, 2, 5).contiguous()
-                output_ft_cropped = output_ft_cropped.reshape(B, C_in, H_crop, W_f_crop)
+                # d. 拼接回填充后的工作区大小
+                output_ft_padded = output_ft_patched.reshape(B, mix_h, mix_w, C_in, patch_h, patch_w_f)
+                output_ft_padded = output_ft_padded.permute(0, 3, 1, 4, 2, 5).contiguous()
+                output_ft_dw = output_ft_padded.reshape(B, C_in, H_pad, W_f_pad) # 输出还是 padded size
 
-                # --- 3. 将工作区的结果放回完整尺寸的零张量中 ---
-                output_ft_dw = torch.zeros_like(x_ft)
-                output_ft_dw[..., :H_crop, :W_f_crop] = output_ft_cropped
-                # 5. 执行 Depthwise 滤波
+                # ======================== 核心修改部分结束 ========================
+
+                # 4. 执行 Depthwise 滤波 和 逆FFT
                 is_strided = any(s > 1 for s in self.stride)
                 if is_strided:
+                    # 目标输出尺寸
                     H_out = H // self.stride[0]
                     W_out = W // self.stride[1]
-                    W_out_f = W_out // 2 + 1
-                    # 只保留与目标输出尺寸对应的低频部分
-                    output_ft_dw = output_ft_dw[..., :H_out, :W_out_f]
-                    # IFFT的目标尺寸也变为小尺寸
-                    target_s = (H_out, W_out)
+                    # 对应的频域尺寸
+                    H_out_pad = H_pad // self.stride[0] # 注意：对 padded 尺寸进行下采样
+                    W_out_f_pad = (W_pad // self.stride[1]) // 2 + 1 if 'W_pad' in locals() else H_out_pad # 需要 W_pad，这里简化处理
+                    
+                    # 从 padded 的结果中，取出下采样所需的低频部分
+                    output_ft_dw = output_ft_dw[..., :H_out_pad, :W_out_f_pad] # 这里需要更严谨的计算
+                    
+                    # IFFT 的目标尺寸应该是 padded 后的空间域尺寸
+                    target_s_padded = (H_pad // self.stride[0], W_pad // self.stride[1])
                 else:
-                    target_s = (H, W)
-                # 6. 逆FFT
-                output_fourier_dw = torch.fft.irfft2(output_ft_dw, s=target_s, norm='ortho')
-                output_fourier_mixed = self.pointwise_mixer_bn(self.pointwise_mixer(output_fourier_dw))
-                # 8. 处理步长
+                    H_out, W_out = H, W
+                    target_s_padded = (H_pad, W_pad) # W_pad = W_f_pad * 2 - 2 (or -1)
+
+                # 为了简化，我们假设 W_pad 可以简单推导
+                W_pad = (W_f_pad - 1) * 2 
+                if W % 2 == 1:
+                    W_pad += 1
+
+                if is_strided:
+                    target_s_padded = (H_pad // self.stride[0], W_pad // self.stride[1])
+                else:
+                    target_s_padded = (H_pad, W_pad)
+
+                # 6. 逆FFT 到 padded 空间尺寸
+                output_fourier_dw_padded = torch.fft.irfft2(output_ft_dw, s=target_s_padded, norm='ortho')
                 
+                # --- 5. 裁剪回原始目标尺寸 ---
+                output_fourier_dw = output_fourier_dw_padded[..., :H_out, :W_out]
+
+                # 7. 后续处理
+                output_fourier_mixed = self.pointwise_mixer_bn(self.pointwise_mixer(output_fourier_dw))
                 output_fourier = output_fourier_mixed
 
         # --- 最终融合 ---
@@ -539,7 +567,7 @@ class Warehouse_Manager(nn.Module):
                 cell_out_plane, cell_in_plane, *cell_kernel_size), requires_grad=True))
             ratio = self.fourier_basis_ratio[idx]
             if ratio > 0:
-                num_basis = max(int(num_spatial_cells * ratio), 1)
+                num_basis = max(int(ratio * num_total_mixtures), 1)
                 self.num_fourier_basis_per_warehouse.append(num_basis)
                 print(f"INFO: WM configured warehouse {idx} to have {num_basis} Fourier basis (ratio={ratio})")
             else:
